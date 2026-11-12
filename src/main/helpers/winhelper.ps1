@@ -35,6 +35,25 @@ interface IMMDeviceEnumerator {
 }
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject { }
 
+// Leser stdin på en egen tråd: Console.In.ReadLineAsync blokkerer i Windows PowerShell.
+public static class ZapdockInput {
+  static readonly System.Collections.Concurrent.ConcurrentQueue<string> queue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+  static volatile bool closed = false;
+  public static void Start() {
+    var t = new System.Threading.Thread(() => {
+      try {
+        string line;
+        while ((line = Console.In.ReadLine()) != null) queue.Enqueue(line);
+      } catch { }
+      closed = true;
+    });
+    t.IsBackground = true;
+    t.Start();
+  }
+  public static string Next() { string l; return queue.TryDequeue(out l) ? l : null; }
+  public static bool Closed { get { return closed && queue.IsEmpty; } }
+}
+
 public class ZapdockAudio {
   static IAudioEndpointVolume Vol() {
     var enumerator = new MMDeviceEnumeratorComObject() as IMMDeviceEnumerator;
@@ -209,18 +228,19 @@ function Invoke-ZdCommand($line) {
 }
 
 Out-Json @{ type = 'ready'; media = $mediaOk }
-$reader = [Console]::In
-$pending = $reader.ReadLineAsync()
+[ZapdockInput]::Start()
 $tick = 0
 while ($true) {
-  while ($pending.IsCompleted) {
-    $line = $pending.Result
-    if ($null -eq $line) { exit 0 } # stdin lukket: Zapdock er avsluttet
+  while ($null -ne ($line = [ZapdockInput]::Next())) {
     if ($line) { Invoke-ZdCommand $line }
-    $pending = $reader.ReadLineAsync()
   }
-  if ($tick % 4 -eq 0) { Emit-Media ($tick % 40 -eq 0) }
-  if ($tick % 2 -eq 0) { Emit-Audio }
+  if ([ZapdockInput]::Closed) { exit 0 } # stdin lukket: Zapdock er avsluttet
+  try {
+    if ($tick % 4 -eq 0) { Emit-Media ($tick % 40 -eq 0) }
+    if ($tick % 2 -eq 0) { Emit-Audio }
+  } catch {
+    Out-Json @{ type = 'error'; scope = 'loop'; message = $_.Exception.Message }
+  }
   $tick++
   Start-Sleep -Milliseconds 250
 }

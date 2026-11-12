@@ -35,11 +35,12 @@ ps.on('exit', (code) => {
   const msgs = out.split(/\r?\n/).filter(Boolean).map((l) => {
     try { return JSON.parse(l); } catch (_) { return { raw: l }; }
   });
-  console.log('hjelper-meldinger:', msgs.map((m) => m.type || m.raw));
+  console.log('hjelper-meldinger:', msgs.map((m) => (m.type === 'error' ? `error(${m.scope}): ${m.message}` : m.type || m.raw)));
   if (err) console.log('stderr:', err.trim());
   assert.ok(msgs.some((m) => m.type === 'ready'), 'hjelperen skal melde ready');
   assert.ok(msgs.some((m) => m.type === 'pong'), 'hjelperen skal svare på ping');
   assert.ok(msgs.some((m) => m.type === 'audio'), 'hjelperen skal sende audio-status (evt. med feil)');
+  assert.ok(msgs.some((m) => m.type === 'media'), 'hjelperen skal sende media-status');
   assert.strictEqual(code, 0, `hjelperen skal avslutte rent (kode ${code})`);
   console.log('smoke-win: OK');
 });

@@ -1,0 +1,42 @@
+{
+  "name": "zapdock",
+  "productName": "Zapdock",
+  "version": "0.1.0",
+  "description": "Oppgavelinje-erstatning for Windows med moduler: Claude Code-bruk, YouTube, Stremio og live forhåndsvisning av spill (WoW).",
+  "main": "src/main/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check src/main/*.js && node --check src/renderer/*.js && node --check src/renderer/modules/*.js && node scripts/test-claude-usage.js",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "xyz.zapdock.app",
+    "productName": "Zapdock",
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "asarUnpack": [
+      "node_modules/koffi/**"
+    ]
+  }
+}

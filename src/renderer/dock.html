@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="nb">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'">
+  <title>Zapdock</title>
+  <link rel="stylesheet" href="theme.css">
+  <link rel="stylesheet" href="dock.css">
+</head>
+<body>
+  <div id="bar">
+    <button id="start" class="tile" title="Start"></button>
+    <div id="pinned" class="group"></div>
+    <div id="windows" class="group"></div>
+    <div class="spacer"></div>
+    <div id="modules" class="group"></div>
+    <div id="clock" title="">
+      <div id="time">--:--</div>
+      <div id="date"></div>
+    </div>
+    <button id="desktop" title="Vis skrivebordet"></button>
+  </div>
+  <script src="icons.js"></script>
+  <script src="dock.js"></script>
+</body>
+</html>

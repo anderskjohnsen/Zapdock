@@ -4,12 +4,13 @@ const { contextBridge, ipcRenderer } = require('electron');
 const SEND = new Set([
   'taskbar:click', 'pinned:launch', 'shell:start', 'shell:desktop', 'shell:notifications',
   'module:toggle', 'module:drag', 'panel:setMode', 'panel:hide', 'preview:activate',
-  'claude:openDir', 'media:state', 'media:toggle', 'menu:module', 'menu:window', 'menu:bar',
+  'media:state', 'media:toggle', 'menu:module', 'menu:window', 'menu:bar', 'shell:quicksettings',
+  'audio:set', 'audio:mute', 'settings:open', 'settings:relaunch', 'settings:openFile',
 ]);
-const INVOKE = new Set(['config:get', 'panel:init', 'taskbar:icon', 'claude:refresh']);
+const INVOKE = new Set(['config:get', 'panel:init', 'taskbar:icon', 'module:action', 'settings:get', 'settings:save']);
 const ON = new Set([
   'taskbar:windows', 'taskbar:active', 'modules:state', 'panel:mode', 'preview:status',
-  'claude:summary', 'media:toggle', 'web:reload',
+  'module:data', 'audio', 'media:toggle', 'web:reload',
 ]);
 
 contextBridge.exposeInMainWorld('zapdock', {

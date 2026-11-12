@@ -1,5 +1,5 @@
 'use strict';
-/* global zapdock, zdIcon, ZD_MODULES */
+/* global zapdock, zdIcon, ZD, ZD_MODULES */
 
 (async () => {
   const id = new URLSearchParams(location.search).get('id');
@@ -26,14 +26,30 @@
   zapdock.on('panel:mode', applyMode);
   btnMode.addEventListener('click', () => zapdock.send('panel:setMode', { id, mode: mode === 'floating' ? 'docked' : 'floating' }));
   document.getElementById('btn-close').addEventListener('click', () => zapdock.send('panel:hide', id));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && mode === 'docked' && !document.fullscreenElement) zapdock.send('panel:hide', id);
+  });
 
   const factory = ZD_MODULES[mod.type];
-  if (factory) {
-    factory({
-      mod,
-      init,
-      body: document.getElementById('body'),
-      tools: document.getElementById('head-tools'),
-    });
+  if (!factory) return;
+  const inst = factory({
+    mod,
+    init,
+    body: document.getElementById('body'),
+    tools: document.getElementById('head-tools'),
+    action: (name, payload) => ZD.action(id, name, payload),
+    toolButton(icon, title, fn) {
+      const b = document.createElement('button');
+      b.className = 'hbtn';
+      b.title = title;
+      b.innerHTML = zdIcon(icon);
+      b.addEventListener('click', fn);
+      document.getElementById('head-tools').appendChild(b);
+      return b;
+    },
+  }) || {};
+  if (inst.update) {
+    inst.update(init.data);
+    zapdock.on('module:data', (d) => inst.update(d));
   }
 })();

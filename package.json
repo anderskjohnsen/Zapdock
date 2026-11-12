@@ -1,14 +1,15 @@
 {
   "name": "zapdock",
   "productName": "Zapdock",
-  "version": "0.1.0",
-  "description": "Oppgavelinje-erstatning for Windows med moduler: Claude Code-bruk, YouTube, Stremio og live forhåndsvisning av spill (WoW).",
+  "version": "1.0.0",
+  "description": "Oppgavelinje-erstatning for Windows med moduler: Claude Code-økter, Spotify, YouTube, Stremio, live WoW-forhåndsvisning, kalender, vær, timer, notater, utklipp og systemmonitor.",
   "main": "src/main/main.js",
   "private": true,
   "scripts": {
     "start": "electron .",
-    "check": "node --check src/main/*.js && node --check src/renderer/*.js && node --check src/renderer/modules/*.js && node scripts/test-claude-usage.js",
-    "dist": "electron-builder --win nsis portable"
+    "check": "node scripts/check-syntax.js && node scripts/test-claude-usage.js && node scripts/test-ics.js",
+    "dist": "electron-builder --win nsis portable",
+    "test": "npm run check"
   },
   "dependencies": {
     "koffi": "^2.9.0"
@@ -29,14 +30,27 @@
       "target": [
         "nsis",
         "portable"
-      ]
+      ],
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "shortcutName": "Zapdock",
+      "runAfterFinish": true
     },
     "asarUnpack": [
-      "node_modules/koffi/**"
-    ]
+      "node_modules/koffi/**",
+      "src/main/helpers/**"
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "portable": {
+      "artifactName": "Zapdock-${version}-portable.exe"
+    }
   }
 }

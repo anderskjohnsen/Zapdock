@@ -1,40 +1,45 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, screen, Menu, shell, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Menu, shell, globalShortcut, Notification } = require('electron');
 const path = require('path');
 const win32 = require('./win32');
-const { loadConfig, createStateStore } = require('./config');
-const { ClaudeUsage } = require('./claudeUsage');
+const { loadConfig, createStateStore, writeJson, readJson, WEB_PRESETS, DEFAULT_MODULES, DEFAULT_CONFIG, CONFIG_VERSION } = require('./config');
+const PROVIDERS = require('./providers');
+const { WinHelper } = require('./services/winhelper');
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
   return;
 }
 
-// Google/YouTube blokkerer innlogging fra "Electron"-useragent.
+app.setAppUserModelId('xyz.zapdock.app');
+// Google/YouTube/Discord blokkerer innlogging fra "Electron"-useragent.
 app.userAgentFallback = app.userAgentFallback
   .replace(/\sElectron\/\S+/i, '')
   .replace(/\szapdock\/\S+/i, '');
 
 const RENDERER = path.join(__dirname, '..', 'renderer');
 const PRELOAD = path.join(__dirname, 'preload.js');
+const ICON = path.join(__dirname, '..', '..', 'assets', 'icon.png');
 const APPBAR_MSG = 0x0400 + 0x101; // WM_USER + n
 const ABN_POSCHANGED = 1;
 const ABN_FULLSCREENAPP = 2;
-const GRIP = 22; // høyden på dra-stripen i forhåndsvisningen (DIP)
+const GRIP = 22; // høyden på tittelstripen i forhåndsvisningen (DIP)
 
 let config;
 let configFile;
 let store;
 let dock = null;
 let appbar = null;
+let settingsWin = null;
 let quitting = false;
-let usage = null;
-let lastUsage = null;
+let fullscreenApp = false;
+const winhelper = new WinHelper();
 const panels = new Map(); // id -> { win, mod, mode, lastBlurHide, anchor, playing, dragging }
+const providers = new Map(); // id -> provider
+const moduleData = new Map(); // id -> siste data
+const previews = new Map(); // id -> { target, thumb, thumbDest, suppressed, minimized, running }
 const iconCache = new Map();
-
 const taskbar = { windows: [], json: '', foreground: 0, lastExternal: 0 };
-const preview = { target: 0, thumb: 0, thumbDest: 0, suppressed: false, minimized: false, running: false };
 
 // ---------------------------------------------------------------------------
 // Hjelpere
@@ -43,7 +48,8 @@ const send = (wc, channel, payload) => {
   if (wc && !wc.isDestroyed()) wc.send(channel, payload);
 };
 const sendDock = (channel, payload) => dock && send(dock.webContents, channel, payload);
-const getModule = (id) => config.modules.find((m) => m.id === id);
+const enabledModules = () => config.modules.filter((m) => m.enabled !== false);
+const getModule = (id) => enabledModules().find((m) => m.id === id);
 const modState = (id) => (store.data.modules[id] ||= { mode: 'docked' });
 
 function ownHandles() {
@@ -53,15 +59,24 @@ function ownHandles() {
   return set;
 }
 
+const DEFAULT_SIZES = {
+  claude: [420, 600], media: [360, 480], preview: [400, 247], calendar: [380, 560], weather: [400, 520],
+  timer: [340, 440], notes: [400, 520], clipboard: [420, 540], system: [380, 440], web: [960, 600],
+};
 function defaultSize(mod) {
   if (Array.isArray(mod.size)) return mod.size;
-  if (mod.type === 'claude') return [400, 560];
-  if (mod.type === 'preview') return [400, 243];
-  return [960, 600];
+  return DEFAULT_SIZES[mod.type] || [400, 520];
 }
 
 function rectsOverlap(a, b) {
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+}
+
+function notify({ title, body, onClick, urgent }) {
+  if (!Notification.isSupported()) return;
+  const n = new Notification({ title, body: body || '', silent: false, urgency: urgent ? 'critical' : 'normal', icon: ICON });
+  if (onClick) n.on('click', onClick);
+  n.show();
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +99,7 @@ function applyTaskbarVisibility() {
 }
 
 function restoreTaskbar() {
-  if (!win32.available) return;
+  if (!win32.available || !store) return;
   const t = store.data.taskbar;
   if (!t.hiddenByZapdock) return;
   try {
@@ -97,7 +112,7 @@ function restoreTaskbar() {
 }
 
 // ---------------------------------------------------------------------------
-// Docken (selve linjen)
+// Docken
 
 function createDock() {
   dock = new BrowserWindow({
@@ -114,6 +129,7 @@ function createDock() {
     thickFrame: false,
     backgroundColor: '#0f1116',
     title: 'Zapdock',
+    icon: ICON,
     webPreferences: { preload: PRELOAD, contextIsolation: true, sandbox: false },
   });
   dock.setAlwaysOnTop(true, 'pop-up-menu');
@@ -124,6 +140,10 @@ function createDock() {
     // Utvikling/feilsøking: ZAPDOCK_OPEN=claude,youtube:floating åpner moduler ved oppstart.
     for (const spec of (process.env.ZAPDOCK_OPEN || '').split(',').filter(Boolean)) {
       const [id, mode] = spec.split(':');
+      if (id === 'settings') {
+        openSettings();
+        continue;
+      }
       if (!getModule(id)) continue;
       if (mode === 'floating') setMode(id, 'floating');
       showPanel(ensurePanel(id));
@@ -138,8 +158,8 @@ function createDock() {
       const code = Number(wParam.readBigUInt64LE(0));
       if (code === ABN_POSCHANGED) positionDock();
       else if (code === ABN_FULLSCREENAPP) {
-        const entering = Number(lParam.readBigUInt64LE(0)) !== 0;
-        if (entering) dock.hide();
+        fullscreenApp = Number(lParam.readBigUInt64LE(0)) !== 0;
+        if (fullscreenApp) dock.hide();
         else dock.showInactive();
       }
     });
@@ -167,7 +187,7 @@ function positionDock() {
 }
 
 // ---------------------------------------------------------------------------
-// Modulvinduer (panel som henger over docken, eller frittflytende "alltid øverst")
+// Modulvinduer (panel over docken, eller frittflytende "alltid øverst")
 
 function ensurePanel(id) {
   let p = panels.get(id);
@@ -176,11 +196,12 @@ function ensurePanel(id) {
   if (!mod) return null;
   const st = modState(id);
   const [w, h] = st.size || defaultSize(mod);
+  const isPreview = mod.type === 'preview';
   const win = new BrowserWindow({
     width: w,
     height: h,
-    minWidth: mod.type === 'preview' ? 200 : 300,
-    minHeight: mod.type === 'preview' ? 120 : 200,
+    minWidth: isPreview ? 200 : 300,
+    minHeight: isPreview ? 120 : 200,
     show: false,
     frame: false,
     skipTaskbar: true,
@@ -190,6 +211,7 @@ function ensurePanel(id) {
     fullscreenable: mod.type === 'web',
     backgroundColor: '#12141b',
     title: mod.title,
+    icon: ICON,
     webPreferences: {
       preload: PRELOAD,
       contextIsolation: true,
@@ -204,7 +226,7 @@ function ensurePanel(id) {
   panels.set(id, p);
 
   win.on('blur', () => {
-    if (p.mode === 'docked' && mod.type !== 'preview' && !p.dragging && win.isVisible() && !win.isFullScreen()) {
+    if (p.mode === 'docked' && !isPreview && !p.dragging && win.isVisible() && !win.isFullScreen()) {
       p.lastBlurHide = Date.now();
       win.hide();
     }
@@ -218,7 +240,7 @@ function ensurePanel(id) {
     if (p.mode === 'floating') modState(id).bounds = b;
     store.save();
   });
-  if (mod.type === 'preview') win.on('resize', updateThumb);
+  if (isPreview) win.on('resize', () => updateThumb(id));
   win.on('close', (e) => {
     if (!quitting) {
       e.preventDefault();
@@ -235,8 +257,12 @@ function placeDocked(p) {
   const disp = screen.getDisplayMatching(db).bounds;
   const [w, h] = modState(p.mod.id).size || defaultSize(p.mod);
   let x;
-  if (p.mod.type === 'preview') x = db.x + db.width - w - 12;
-  else if (p.anchor) x = db.x + p.anchor.x + p.anchor.width / 2 - w / 2;
+  if (p.mod.type === 'preview') {
+    // Stable flere forhåndsvisninger ved siden av hverandre fra høyre.
+    const ids = enabledModules().filter((m) => m.type === 'preview').map((m) => m.id);
+    const idx = Math.max(0, ids.indexOf(p.mod.id));
+    x = db.x + db.width - (w + 12) * (idx + 1);
+  } else if (p.anchor) x = db.x + p.anchor.x + p.anchor.width / 2 - w / 2;
   else x = db.x + db.width / 2 - w / 2;
   x = Math.max(disp.x + 8, Math.min(x, disp.x + disp.width - w - 8));
   const y = config.bar.edge === 'top' ? db.y + db.height + 8 : db.y - h - 8;
@@ -262,12 +288,19 @@ function setMode(id, mode) {
 }
 
 function showPanel(p, { focus = true } = {}) {
+  if (!p) return;
   if (p.mode === 'docked') placeDocked(p);
   else placeFloating(p);
   if (focus) p.win.show();
   else p.win.showInactive();
   p.win.setAlwaysOnTop(true, 'floating');
-  if (p.mod.type === 'preview') ensureThumb();
+  if (p.mod.type === 'preview') ensureThumb(p.mod.id);
+}
+
+function openPanel(id) {
+  const p = ensurePanel(id);
+  if (p && !p.win.isVisible()) showPanel(p);
+  else if (p) p.win.focus();
 }
 
 function togglePanel(id, anchor) {
@@ -275,11 +308,12 @@ function togglePanel(id, anchor) {
   if (!p) return;
   if (anchor) p.anchor = anchor;
   if (p.mod.type === 'preview') {
+    const pv = previewState(id);
     if (p.win.isVisible()) {
-      preview.suppressed = true;
+      pv.suppressed = true;
       p.win.hide();
     } else {
-      preview.suppressed = false;
+      pv.suppressed = false;
       showPanel(p, { focus: false });
     }
     return;
@@ -304,8 +338,7 @@ function onPanelMoved(id) {
       store.save();
     }
   } else if (!overDock) {
-    // Panelet ble dratt bort fra docken -> blir eget vindu
-    setMode(id, 'floating');
+    setMode(id, 'floating'); // dratt bort fra docken -> eget vindu
   } else {
     placeDocked(p);
   }
@@ -313,21 +346,67 @@ function onPanelMoved(id) {
 
 function pushModuleState() {
   const out = {};
-  for (const mod of config.modules) {
+  for (const mod of enabledModules()) {
     const p = panels.get(mod.id);
     out[mod.id] = {
       visible: !!(p && !p.win.isDestroyed() && p.win.isVisible()),
       mode: p ? p.mode : modState(mod.id).mode || 'docked',
       playing: !!(p && p.playing),
     };
-    if (mod.type === 'claude' && lastUsage) out[mod.id].badge = lastUsage.activeCount || null;
-    if (mod.type === 'preview') out[mod.id].running = preview.running;
+    if (mod.type === 'preview') out[mod.id].running = !!(previews.get(mod.id) || {}).running;
   }
   sendDock('modules:state', out);
 }
 
 // ---------------------------------------------------------------------------
+// Datatjenester for modulene
+
+function publish(id, data) {
+  moduleData.set(id, data);
+  sendDock('module:data', { id, data });
+  const p = panels.get(id);
+  if (p) send(p.win.webContents, 'module:data', data);
+}
+
+function startProviders() {
+  for (const mod of enabledModules()) {
+    const factory = PROVIDERS[mod.type];
+    if (!factory) continue;
+    const provider = factory({
+      mod,
+      config,
+      store,
+      win32,
+      winhelper,
+      shell,
+      userData: app.getPath('userData'),
+      publish: (data) => publish(mod.id, data),
+      notify,
+      openPanel: () => openPanel(mod.id),
+      taskbarWindows: () => taskbar.windows,
+    });
+    providers.set(mod.id, provider);
+    try {
+      provider.start();
+    } catch (err) {
+      console.error(`[zapdock] modul ${mod.id} feilet ved start:`, err);
+    }
+  }
+}
+
+function stopProviders() {
+  for (const p of providers.values()) {
+    try { p.stop(); } catch (_) { /* ignorer */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Live forhåndsvisning (DWM-miniatyr av f.eks. WoW)
+
+function previewState(id) {
+  if (!previews.has(id)) previews.set(id, { target: 0, thumb: 0, thumbDest: 0, suppressed: false, minimized: false, running: false });
+  return previews.get(id);
+}
 
 function findPreviewTarget(mod) {
   const exes = (mod.match || []).map((s) => s.toLowerCase());
@@ -343,34 +422,34 @@ function findPreviewTarget(mod) {
   return 0;
 }
 
-function releaseThumb() {
-  if (preview.thumb) win32.thumbUnregister(preview.thumb);
-  preview.thumb = 0;
-  preview.thumbDest = 0;
+function releaseThumb(id) {
+  const pv = previewState(id);
+  if (pv.thumb) win32.thumbUnregister(pv.thumb);
+  pv.thumb = 0;
+  pv.thumbDest = 0;
 }
 
-function ensureThumb() {
-  const mod = config.modules.find((m) => m.type === 'preview');
-  const p = mod && panels.get(mod.id);
-  if (!p || !preview.target || !win32.available) return;
+function ensureThumb(id) {
+  const pv = previewState(id);
+  const p = panels.get(id);
+  if (!p || !pv.target || !win32.available) return;
   const dest = win32.hwndOf(p.win);
-  if (!preview.thumb || preview.thumbDest !== dest) {
-    releaseThumb();
-    preview.thumb = win32.thumbRegister(dest, preview.target);
-    preview.thumbDest = dest;
+  if (!pv.thumb || pv.thumbDest !== dest) {
+    releaseThumb(id);
+    pv.thumb = win32.thumbRegister(dest, pv.target);
+    pv.thumbDest = dest;
   }
-  updateThumb();
+  updateThumb(id);
 }
 
-function updateThumb() {
-  if (!preview.thumb) return;
-  const mod = config.modules.find((m) => m.type === 'preview');
-  const p = mod && panels.get(mod.id);
-  if (!p || p.win.isDestroyed()) return;
+function updateThumb(id) {
+  const pv = previewState(id);
+  const p = panels.get(id);
+  if (!pv.thumb || !p || p.win.isDestroyed()) return;
   const [cw, ch] = p.win.getContentSize();
   const scale = screen.getDisplayMatching(p.win.getBounds()).scaleFactor;
   const area = { x: 0, y: GRIP * scale, width: cw * scale, height: (ch - GRIP) * scale };
-  const src = win32.thumbSourceSize(preview.thumb);
+  const src = win32.thumbSourceSize(pv.thumb);
   let rect = area;
   if (src && src.width > 0 && src.height > 0) {
     const s = Math.min(area.width / src.width, area.height / src.height);
@@ -379,39 +458,42 @@ function updateThumb() {
     rect = { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
   }
   rect = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
-  win32.thumbUpdate(preview.thumb, rect, !preview.minimized);
+  win32.thumbUpdate(pv.thumb, rect, !pv.minimized);
 }
 
 function previewTick(fg, own) {
-  const mod = config.modules.find((m) => m.type === 'preview');
-  if (!mod) return;
-  const target = findPreviewTarget(mod);
-  if (target !== preview.target) {
-    releaseThumb();
-    preview.target = target;
-  }
-  const running = !!target;
-  const minimized = running && win32.isMinimized(target);
-  const p = panels.get(mod.id);
-  if (running !== preview.running || minimized !== preview.minimized) {
-    preview.running = running;
-    preview.minimized = minimized;
-    if (p) send(p.win.webContents, 'preview:status', { running, minimized, supported: win32.available });
-    updateThumb();
-    pushModuleState();
-  }
-  if (!running) {
-    if (p && p.win.isVisible() && mod.autoShow !== false) p.win.hide();
-    return;
-  }
-  if (fg === target) {
-    preview.suppressed = false;
-    if (p && p.win.isVisible()) p.win.hide();
-    return;
-  }
-  if (own.has(fg) || !fg) return; // bruker holder på i Zapdock
-  if (mod.autoShow !== false && !preview.suppressed && !(p && p.win.isVisible())) {
-    showPanel(ensurePanel(mod.id), { focus: false });
+  for (const mod of enabledModules()) {
+    if (mod.type !== 'preview') continue;
+    const id = mod.id;
+    const pv = previewState(id);
+    const target = findPreviewTarget(mod);
+    if (target !== pv.target) {
+      releaseThumb(id);
+      pv.target = target;
+    }
+    const running = !!target;
+    const minimized = running && win32.isMinimized(target);
+    const p = panels.get(id);
+    if (running !== pv.running || minimized !== pv.minimized) {
+      pv.running = running;
+      pv.minimized = minimized;
+      if (p) send(p.win.webContents, 'preview:status', { running, minimized, supported: win32.available });
+      updateThumb(id);
+      pushModuleState();
+    }
+    if (!running) {
+      if (p && p.win.isVisible() && mod.autoShow !== false) p.win.hide();
+      continue;
+    }
+    if (fg === target) {
+      pv.suppressed = false;
+      if (p && p.win.isVisible()) p.win.hide();
+      continue;
+    }
+    if (own.has(fg) || !fg || fullscreenApp) continue;
+    if (mod.autoShow !== false && !pv.suppressed && !(p && p.win.isVisible())) {
+      showPanel(ensurePanel(id), { focus: false });
+    }
   }
 }
 
@@ -445,37 +527,83 @@ function tick() {
   tickN++;
 }
 
-function refreshUsage() {
-  try {
-    lastUsage = usage.scan();
-  } catch (err) {
-    console.error('[zapdock] claude-usage:', err);
+// ---------------------------------------------------------------------------
+// Innstillinger
+
+function openSettings() {
+  if (settingsWin && !settingsWin.isDestroyed()) {
+    settingsWin.show();
+    settingsWin.focus();
     return;
   }
-  for (const mod of config.modules) {
-    if (mod.type !== 'claude') continue;
-    const p = panels.get(mod.id);
-    if (p) send(p.win.webContents, 'claude:summary', lastUsage);
+  settingsWin = new BrowserWindow({
+    width: 860,
+    height: 720,
+    minWidth: 640,
+    minHeight: 480,
+    title: 'Zapdock – innstillinger',
+    backgroundColor: '#0f1116',
+    icon: ICON,
+    autoHideMenuBar: true,
+    webPreferences: { preload: PRELOAD, contextIsolation: true, sandbox: false },
+  });
+  settingsWin.setMenu(null);
+  settingsWin.loadFile(path.join(RENDERER, 'settings.html'));
+  settingsWin.on('closed', () => { settingsWin = null; });
+}
+
+function saveSettings(next) {
+  const user = readJson(configFile) || {};
+  const merged = { ...user, ...next, version: CONFIG_VERSION };
+  writeJson(configFile, merged);
+  if (typeof next.autostart === 'boolean') {
+    app.setLoginItemSettings({ openAtLogin: next.autostart });
+    delete merged.autostart;
+    writeJson(configFile, merged);
   }
-  pushModuleState();
+}
+
+function relaunch() {
+  app.relaunch();
+  quit();
 }
 
 // ---------------------------------------------------------------------------
 // IPC
 
 function registerIpc() {
-  ipcMain.handle('config:get', () => ({ bar: config.bar, modules: config.modules, pinned: config.pinned, platform: process.platform }));
+  ipcMain.handle('config:get', () => ({
+    bar: config.bar,
+    modules: enabledModules(),
+    pinned: config.pinned,
+    claude: config.claude,
+    platform: process.platform,
+    data: Object.fromEntries(moduleData),
+    audio: winhelper.available ? winhelper.audio : null,
+  }));
 
   ipcMain.handle('panel:init', (e, id) => {
     const mod = getModule(id);
-    const p = panels.get(id);
+    const pv = previews.get(id) || {};
     return {
       mod,
-      mode: p ? p.mode : 'docked',
+      mode: panels.get(id) ? panels.get(id).mode : 'docked',
       platform: process.platform,
-      preview: { running: preview.running, minimized: preview.minimized, supported: win32.available },
-      claude: mod && mod.type === 'claude' ? lastUsage : null,
+      data: moduleData.get(id) || null,
+      preview: { running: !!pv.running, minimized: !!pv.minimized, supported: win32.available },
     };
+  });
+
+  ipcMain.handle('module:action', async (e, { id, action, payload }) => {
+    const p = providers.get(id);
+    if (!p || !p.action) return null;
+    try {
+      const r = await p.action(action, payload || {});
+      return r === undefined ? null : JSON.parse(JSON.stringify(r));
+    } catch (err) {
+      console.error(`[zapdock] ${id}.${action}:`, err);
+      return { error: err.message };
+    }
   });
 
   ipcMain.handle('taskbar:icon', async (e, exe) => {
@@ -507,6 +635,11 @@ function registerIpc() {
   ipcMain.on('shell:start', () => win32.available && win32.pressKeys([win32.VK.LWIN]));
   ipcMain.on('shell:desktop', () => win32.available && win32.pressKeys([win32.VK.LWIN, win32.VK.D]));
   ipcMain.on('shell:notifications', () => win32.available && win32.pressKeys([win32.VK.LWIN, win32.VK.N]));
+  ipcMain.on('shell:quicksettings', () => win32.available && win32.pressKeys([win32.VK.LWIN, win32.VK.A]));
+
+  ipcMain.on('audio:set', (e, v) => winhelper.send(`audio set ${Math.max(0, Math.min(1, Number(v) || 0)).toFixed(3)}`));
+  ipcMain.on('audio:mute', () => winhelper.send('audio togglemute'));
+  winhelper.on('audio', (a) => sendDock('audio', a));
 
   ipcMain.on('module:toggle', (e, { id, anchor }) => togglePanel(id, anchor));
 
@@ -520,14 +653,14 @@ function registerIpc() {
         modState(id).mode = 'floating';
         send(p.win.webContents, 'panel:mode', 'floating');
       }
-      if (p.mod.type === 'preview') preview.suppressed = false;
+      if (p.mod.type === 'preview') previewState(id).suppressed = false;
     }
     const [w, h] = p.win.getSize();
     const ny = config.bar.edge === 'top' ? Math.round(y) - 12 : Math.round(y) - h + 12;
     p.win.setBounds({ x: Math.round(x - w / 2), y: ny, width: w, height: h });
     if (!p.win.isVisible()) {
       p.win.showInactive();
-      if (p.mod.type === 'preview') ensureThumb();
+      if (p.mod.type === 'preview') ensureThumb(id);
     }
     if (phase === 'end') {
       p.dragging = false;
@@ -542,19 +675,14 @@ function registerIpc() {
   ipcMain.on('panel:hide', (e, id) => {
     const p = panels.get(id);
     if (!p) return;
-    if (p.mod.type === 'preview') preview.suppressed = true;
+    if (p.mod.type === 'preview') previewState(id).suppressed = true;
     p.win.hide();
   });
 
-  ipcMain.on('preview:activate', () => {
-    if (preview.target) win32.activate(preview.target);
+  ipcMain.on('preview:activate', (e, id) => {
+    const pv = previews.get(id);
+    if (pv && pv.target) win32.activate(pv.target);
   });
-
-  ipcMain.handle('claude:refresh', () => {
-    refreshUsage();
-    return lastUsage;
-  });
-  ipcMain.on('claude:openDir', (e, dir) => dir && shell.openPath(dir));
 
   ipcMain.on('media:state', (e, { id, playing }) => {
     const p = panels.get(id);
@@ -565,6 +693,23 @@ function registerIpc() {
     const p = panels.get(id);
     if (p) send(p.win.webContents, 'media:toggle');
   });
+
+  ipcMain.on('settings:open', openSettings);
+  ipcMain.handle('settings:get', () => ({
+    config: readJson(configFile) || DEFAULT_CONFIG,
+    defaults: { modules: DEFAULT_MODULES, config: DEFAULT_CONFIG },
+    presets: WEB_PRESETS,
+    autostart: app.getLoginItemSettings().openAtLogin,
+    platform: process.platform,
+    configFile,
+    version: app.getVersion(),
+  }));
+  ipcMain.handle('settings:save', (e, next) => {
+    saveSettings(next);
+    return true;
+  });
+  ipcMain.on('settings:relaunch', relaunch);
+  ipcMain.on('settings:openFile', () => shell.openPath(configFile));
 
   ipcMain.on('menu:module', (e, id) => {
     const mod = getModule(id);
@@ -580,6 +725,11 @@ function registerIpc() {
       items.push({ label: 'Spill av / pause', click: () => p && send(p.win.webContents, 'media:toggle') });
       items.push({ label: 'Last inn på nytt', click: () => p && send(p.win.webContents, 'web:reload') });
     }
+    if (mod.type === 'media') {
+      items.push({ label: 'Spill av / pause', click: () => providers.get(id).action('toggle') });
+      items.push({ label: 'Neste', click: () => providers.get(id).action('next') });
+      items.push({ label: 'Forrige', click: () => providers.get(id).action('prev') });
+    }
     if (mod.type === 'preview') {
       items.push({
         label: 'Vis automatisk når spillet ikke er i fokus',
@@ -589,23 +739,33 @@ function registerIpc() {
       });
     }
     if (p) items.push({ label: 'Lukk', click: () => p.win.hide() });
+    items.push({ type: 'separator' }, { label: 'Innstillinger …', click: openSettings });
     Menu.buildFromTemplate(items).popup({ window: dock });
   });
 
-  ipcMain.on('menu:window', (e, hwnd) => {
-    Menu.buildFromTemplate([
-      { label: 'Aktiver', click: () => win32.activate(hwnd) },
-      { label: 'Minimer', click: () => win32.minimize(hwnd) },
-      { type: 'separator' },
-      { label: 'Lukk vindu', click: () => win32.closeWindow(hwnd) },
-    ]).popup({ window: dock });
+  ipcMain.on('menu:window', (e, hwnds) => {
+    const list = Array.isArray(hwnds) ? hwnds : [hwnds];
+    const items = [];
+    if (list.length === 1) {
+      items.push({ label: 'Aktiver', click: () => win32.activate(list[0]) }, { label: 'Minimer', click: () => win32.minimize(list[0]) });
+    } else {
+      for (const h of list) {
+        const w = taskbar.windows.find((x) => x.hwnd === h);
+        items.push({ label: (w && w.title ? w.title : String(h)).slice(0, 60), click: () => win32.activate(h) });
+      }
+    }
+    items.push({ type: 'separator' }, {
+      label: list.length > 1 ? `Lukk alle (${list.length})` : 'Lukk vindu',
+      click: () => list.forEach((h) => win32.closeWindow(h)),
+    });
+    Menu.buildFromTemplate(items).popup({ window: dock });
   });
 
   ipcMain.on('menu:bar', () => {
     const login = app.getLoginItemSettings().openAtLogin;
     Menu.buildFromTemplate([
-      { label: 'Åpne innstillinger (config.json)', click: () => shell.openPath(configFile) },
-      { label: 'Last inn på nytt', click: () => { app.relaunch(); quit(); } },
+      { label: 'Innstillinger …', click: openSettings },
+      { label: 'Last inn på nytt', click: relaunch },
       { type: 'separator' },
       {
         label: 'Skjul Windows-oppgavelinjen',
@@ -618,6 +778,7 @@ function registerIpc() {
         },
       },
       { label: 'Start med Windows', type: 'checkbox', checked: login, click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }) },
+      { label: 'Oppgavebehandling', enabled: win32.available, click: () => shell.openPath('taskmgr.exe') },
       { type: 'separator' },
       { label: 'Avslutt Zapdock', click: quit },
     ]).popup({ window: dock });
@@ -627,8 +788,13 @@ function registerIpc() {
 // ---------------------------------------------------------------------------
 // Livssyklus
 
+let cleanedUp = false;
 function cleanup() {
-  releaseThumb();
+  if (cleanedUp) return;
+  cleanedUp = true;
+  stopProviders();
+  winhelper.stop();
+  for (const id of previews.keys()) releaseThumb(id);
   if (appbar) {
     try { win32.appbarRemove(appbar); } catch (_) { /* ignorer */ }
     appbar = null;
@@ -649,7 +815,8 @@ app.on('web-contents-created', (e, contents) => {
     try {
       const cur = new URL(contents.getURL());
       const next = new URL(url);
-      if (cur.hostname === next.hostname) contents.loadURL(url);
+      const sameSite = cur.hostname.split('.').slice(-2).join('.') === next.hostname.split('.').slice(-2).join('.');
+      if (sameSite) contents.loadURL(url);
       else shell.openExternal(url);
     } catch (_) { /* ugyldig url */ }
     return { action: 'deny' };
@@ -662,14 +829,12 @@ app.whenReady().then(() => {
   configFile = loaded.file;
   store = createStateStore(app.getPath('userData'));
 
-  usage = new ClaudeUsage(config.claude);
   registerIpc();
+  winhelper.start();
   applyTaskbarVisibility();
   createDock();
-
+  startProviders();
   setInterval(tick, 500);
-  refreshUsage();
-  setInterval(refreshUsage, Math.max(3, config.claude.refreshSeconds || 10) * 1000);
 
   screen.on('display-metrics-changed', positionDock);
   screen.on('display-added', positionDock);
@@ -682,7 +847,10 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('second-instance', () => dock && dock.showInactive());
+app.on('second-instance', () => {
+  if (dock) dock.showInactive();
+  openSettings();
+});
 app.on('before-quit', () => {
   quitting = true;
   cleanup();

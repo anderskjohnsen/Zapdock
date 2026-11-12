@@ -1,7 +1,7 @@
 'use strict';
 /* global zapdock */
-// Live forhåndsvisning av et annet vindu (WoW). Selve bildet tegnes av Windows (DWM-miniatyr)
-// over dette vinduet; her viser vi bare statusmeldinger og fanger klikk.
+// Live forhåndsvisning av et annet vindu (WoW). Bildet tegnes av Windows (DWM-miniatyr) over vinduet;
+// her vises bare statusmeldinger og klikk fanges.
 window.ZD_MODULES = window.ZD_MODULES || {};
 
 window.ZD_MODULES.preview = ({ mod, init, body }) => {
@@ -9,7 +9,6 @@ window.ZD_MODULES.preview = ({ mod, init, body }) => {
   msg.className = 'pv-msg';
   body.appendChild(msg);
   body.title = `Klikk for å gå til ${mod.title}`;
-
   const render = (s) => {
     if (!s.supported) msg.textContent = 'Live forhåndsvisning krever Windows.';
     else if (!s.running) msg.textContent = `${mod.title} kjører ikke.`;
@@ -18,5 +17,5 @@ window.ZD_MODULES.preview = ({ mod, init, body }) => {
   };
   render(init.preview);
   zapdock.on('preview:status', render);
-  body.addEventListener('click', () => zapdock.send('preview:activate'));
+  body.addEventListener('click', () => zapdock.send('preview:activate', mod.id));
 };

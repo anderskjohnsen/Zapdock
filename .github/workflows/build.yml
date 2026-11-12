@@ -1,0 +1,47 @@
+name: Bygg og test (Windows)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Installer avhengigheter
+        run: npm ci
+
+      - name: Tester (syntaks, Claude-bruk, kalender)
+        run: npm run check
+
+      - name: PowerShell-syntaks for hjelpeprosessen
+        shell: powershell
+        run: |
+          $errors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd\src\main\helpers\winhelper.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | Format-List; exit 1 }
+          Write-Host "winhelper.ps1: ingen syntaksfeil"
+
+      - name: Røyktest av Win32-bindinger og hjelpeprosess
+        run: node scripts/smoke-win.js
+
+      - name: Bygg installasjonsfil og portable .exe
+        run: npx electron-builder --win nsis portable --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zapdock-windows
+          path: |
+            dist/*.exe
+          if-no-files-found: error

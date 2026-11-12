@@ -58,9 +58,11 @@ function addTokens(t, e) {
 }
 
 class ClaudeUsage {
-  constructor({ dirs = [], activeMinutes = 15, blockTokenLimit = 0 } = {}) {
+  constructor({ dirs = [], activeMinutes = 15, blockTokenLimit = 0, waitingVisibleHours = 4, permissionSeconds = 30 } = {}) {
     this.dirs = defaultDirs(dirs);
     this.activeMs = activeMinutes * 60 * 1000;
+    this.waitingVisibleMs = waitingVisibleHours * HOUR;
+    this.permissionMs = permissionSeconds * 1000;
     this.blockTokenLimit = blockTokenLimit;
     this.files = new Map();
   }
@@ -68,7 +70,11 @@ class ClaudeUsage {
   _readFile(info) {
     let st = this.files.get(info.file);
     if (!st || info.size < st.offset) {
-      st = { offset: 0, tail: Buffer.alloc(0), entries: [], sessionId: null, cwd: null, lastType: null, lastStop: null, lastTs: 0 };
+      st = {
+        offset: 0, tail: Buffer.alloc(0), entries: [], sessionId: null, cwd: null, lastTs: 0,
+        lastType: null, lastStop: null, lastToolUse: false, lastInterrupted: false, lastAssistantTs: 0,
+        summary: null, firstPrompt: null,
+      };
       this.files.set(info.file, st);
     }
     st.mtimeMs = info.mtimeMs;
@@ -108,9 +114,26 @@ class ClaudeUsage {
     if (o.sessionId) st.sessionId = o.sessionId;
     const ts = o.timestamp ? Date.parse(o.timestamp) : NaN;
     if (!Number.isNaN(ts)) st.lastTs = Math.max(st.lastTs, ts);
-    if (o.type === 'assistant' || o.type === 'user') {
+    if (o.type === 'summary' && o.summary) st.summary = String(o.summary);
+    if ((o.type === 'assistant' || o.type === 'user') && !o.isMeta && !o.isSidechain) {
+      const content = o.message?.content;
+      const blocks = Array.isArray(content) ? content : [];
       st.lastType = o.type;
-      st.lastStop = o.type === 'assistant' ? o.message?.stop_reason ?? null : null;
+      if (o.type === 'assistant') {
+        st.lastStop = o.message?.stop_reason ?? null;
+        st.lastToolUse = blocks.some((b) => b && b.type === 'tool_use');
+        if (!Number.isNaN(ts)) st.lastAssistantTs = ts;
+        st.lastInterrupted = false;
+      } else {
+        st.lastStop = null;
+        st.lastToolUse = false;
+        const text = typeof content === 'string' ? content : blocks.filter((b) => b && b.type === 'text').map((b) => b.text).join(' ');
+        st.lastInterrupted = /\[Request interrupted by user/.test(text);
+        const isToolResult = blocks.some((b) => b && b.type === 'tool_result');
+        if (!st.firstPrompt && text && !isToolResult && !text.startsWith('<') && !st.lastInterrupted) {
+          st.firstPrompt = text.replace(/\s+/g, ' ').trim().slice(0, 120);
+        }
+      }
     }
     const u = o.message?.usage;
     if (o.type !== 'assistant' || !u || Number.isNaN(ts)) return;
@@ -203,7 +226,10 @@ class ClaudeUsage {
       if (!id) continue;
       let s = sessions.get(id);
       if (!s) {
-        s = { id, cwd: null, lastActivity: 0, lastType: null, lastStop: null, mainMtime: 0, tokens: emptyTokens(), blockTokens: 0, model: null };
+        s = {
+          id, cwd: null, lastActivity: 0, mainMtime: 0, tokens: emptyTokens(), blockTokens: 0, model: null,
+          lastType: null, lastStop: null, lastToolUse: false, lastInterrupted: false, lastAssistantTs: 0, title: null,
+        };
         sessions.set(id, s);
       }
       if (st.cwd && !s.cwd) s.cwd = st.cwd;
@@ -212,6 +238,10 @@ class ClaudeUsage {
         s.mainMtime = st.mtimeMs;
         s.lastType = st.lastType;
         s.lastStop = st.lastStop;
+        s.lastToolUse = st.lastToolUse;
+        s.lastInterrupted = st.lastInterrupted;
+        s.lastAssistantTs = st.lastAssistantTs;
+        s.title = st.summary || st.firstPrompt || s.title;
         if (st.cwd) s.cwd = st.cwd;
       }
     }
@@ -223,14 +253,21 @@ class ClaudeUsage {
       if (activeBlock && e.ts >= activeBlock.start) s.blockTokens += e.input + e.output + e.cacheCreate + e.cacheRead;
     }
     const sessionList = [...sessions.values()]
-      .filter((s) => now - s.lastActivity <= this.activeMs)
-      .sort((a, b) => b.lastActivity - a.lastActivity)
-      .map((s) => ({
+      .map((s) => ({ s, status: sessionStatus(s, now, this.permissionMs) }))
+      .filter(({ s, status }) => {
+        const age = now - s.lastActivity;
+        return age <= this.activeMs || (NEEDS_ANSWER.has(status) && age <= this.waitingVisibleMs);
+      })
+      .sort((a, b) => b.s.lastActivity - a.s.lastActivity)
+      .map(({ s, status }) => ({
         id: s.id,
-        project: s.cwd ? path.basename(s.cwd.replace(/[\\/]+$/, '')) : s.id.slice(0, 8),
+        project: (s.cwd && s.cwd.split(/[\\/]/).filter(Boolean).pop()) || s.id.slice(0, 8),
+        title: s.title,
         cwd: s.cwd,
         lastActivity: s.lastActivity,
-        status: sessionStatus(s, now),
+        status,
+        needsAnswer: NEEDS_ANSWER.has(status),
+        waitingSince: NEEDS_ANSWER.has(status) ? s.lastAssistantTs || s.lastActivity : null,
         model: s.model,
         tokens: s.tokens,
         blockTokens: s.blockTokens,
@@ -246,16 +283,31 @@ class ClaudeUsage {
       days,
       sessions: sessionList,
       activeCount: sessionList.filter((s) => s.status === 'working').length,
+      needsAnswerCount: sessionList.filter((s) => s.needsAnswer).length,
     };
   }
 }
 
-function sessionStatus(s, now) {
+const NEEDS_ANSWER = new Set(['waiting', 'blocked']);
+
+/**
+ * working  – Claude jobber (skriver, kjører verktøy, tenker)
+ * waiting  – Claude er ferdig med svaret og venter på deg
+ * blocked  – et verktøykall har stått uten resultat lenge: venter trolig på tillatelse
+ * idle     – ingenting skjer (avbrutt eller forlatt)
+ */
+function sessionStatus(s, now, permissionMs = 30000) {
   const idle = now - s.lastActivity;
-  if (s.lastType === 'assistant' && s.lastStop === 'end_turn') return 'waiting';
-  if (idle < 90 * 1000) return 'working';
-  if (s.lastType === 'assistant' && s.lastStop === 'tool_use') return 'blocked'; // venter trolig på tillatelse
-  return 'idle';
+  if (s.lastType === 'assistant') {
+    if (s.lastToolUse) return idle < permissionMs ? 'working' : 'blocked';
+    if (s.lastStop === 'end_turn' || idle >= 4000) return 'waiting';
+    return 'working';
+  }
+  if (s.lastType === 'user') {
+    if (s.lastInterrupted) return 'idle';
+    return idle < 10 * 60 * 1000 ? 'working' : 'idle';
+  }
+  return idle < 90 * 1000 ? 'working' : 'idle';
 }
 
-module.exports = { ClaudeUsage, defaultDirs, BLOCK_MS };
+module.exports = { ClaudeUsage, defaultDirs, sessionStatus, BLOCK_MS };

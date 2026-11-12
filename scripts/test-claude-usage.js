@@ -71,5 +71,34 @@ fs.writeFileSync(fileB, asst('3', 5000, 'sess-b', u(1, 1)) + '\n');
 s = usage.scan(now);
 assert.strictEqual(s.sessions.find((x) => x.id === 'sess-b').tokens.total, 12);
 
+// ---- Status: venter på svar / tillatelse ----
+const { sessionStatus } = require('../src/main/claudeUsage');
+const proj2 = path.join(root, 'projects', 'C--Users-anders-familie');
+fs.mkdirSync(proj2, { recursive: true });
+const line = (o) => JSON.stringify({ sessionId: 'sess-c', cwd: 'C:\\Users\\anders\\familie', ...o });
+const fileC = path.join(proj2, 'sess-c.jsonl');
+fs.writeFileSync(fileC, [
+  line({ type: 'user', timestamp: iso(40 * 60000), message: { role: 'user', content: 'Lag ukeplan for middager' } }),
+  // Tekstsvar uten stop_reason (slik Claude Code ofte logger): skal regnes som ferdig
+  line({ type: 'assistant', timestamp: iso(30 * 60000), requestId: 'rc1', message: { id: 'mc1', model: 'claude-opus-5-5', stop_reason: null, content: [{ type: 'text', text: 'Her er planen' }], usage: u(1, 1) } }),
+].join('\n') + '\n');
+const tC = new Date(now - 30 * 60000);
+fs.utimesSync(fileC, tC, tC);
+s = usage.scan(now);
+const c = s.sessions.find((x) => x.id === 'sess-c');
+assert.ok(c, 'ventende økt vises selv etter activeMinutes');
+assert.strictEqual(c.status, 'waiting');
+assert.ok(c.needsAnswer);
+assert.strictEqual(c.waitingSince, now - 30 * 60000);
+assert.strictEqual(c.project, 'familie', 'Windows-sti gir prosjektnavn');
+assert.strictEqual(c.title, 'Lag ukeplan for middager');
+
+const base = { lastActivity: now, lastType: 'assistant', lastToolUse: true, lastStop: 'tool_use' };
+assert.strictEqual(sessionStatus({ ...base, lastActivity: now - 5000 }, now, 30000), 'working');
+assert.strictEqual(sessionStatus({ ...base, lastActivity: now - 60000 }, now, 30000), 'blocked');
+assert.strictEqual(sessionStatus({ ...base, lastToolUse: false, lastStop: 'end_turn' }, now), 'waiting');
+assert.strictEqual(sessionStatus({ lastActivity: now - 120000, lastType: 'user', lastInterrupted: false }, now), 'working', 'Claude tenker');
+assert.strictEqual(sessionStatus({ lastActivity: now - 5000, lastType: 'user', lastInterrupted: true }, now), 'idle');
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log('claude-usage: alle tester OK');
